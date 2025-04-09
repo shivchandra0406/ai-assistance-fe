@@ -1,0 +1,719 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box,
+  TextField,
+  Button,
+  Paper,
+  Typography,
+  IconButton,
+  Dialog,
+  Fab,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  CircularProgress,
+  Alert,
+  Stack,
+  TableSortLabel
+} from '@mui/material';
+import MicIcon from '@mui/icons-material/Mic';
+import StopIcon from '@mui/icons-material/Stop';
+import SendIcon from '@mui/icons-material/Send';
+import SmartToyIcon from '@mui/icons-material/SmartToy';
+import CloseIcon from '@mui/icons-material/Close';
+import DownloadIcon from '@mui/icons-material/Download';
+import FileDownloadIcon from '@mui/icons-material/FileDownload';
+import FullscreenIcon from '@mui/icons-material/Fullscreen';
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
+import SpeechRecognition, { useSpeechRecognition } from 'react-speech-recognition';
+import { saveAs } from 'file-saver';
+import { API } from '../services/api';
+
+interface ExcelData {
+  excel_data: string; // base64 encoded excel data
+  filename: string;
+  row_count: number;
+}
+
+interface BackgroundProcessData {
+  room_id: string;
+  row_count: number;
+}
+
+interface Message {
+  text: string;
+  isUser: boolean;
+  data?: any[];
+  type?: 'text' | 'excel' | 'background_process';
+  excelData?: ExcelData;
+  backgroundData?: BackgroundProcessData;
+  isProcessing?: boolean;
+}
+
+// We could add interfaces for history data if needed in the future
+
+const Assistant: React.FC = () => {
+  // We use Material UI's responsive breakpoints instead of manually tracking mobile state
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isOpen, setIsOpen] = useState(false);
+  // Used by WebSocket to store data for each room
+  const [, setSocketData] = useState<{[key: string]: any[]}>({});
+  // For data table view
+  const [showDataTable, setShowDataTable] = useState(false);
+  const [currentViewData, setCurrentViewData] = useState<any[]>([]);
+  const [orderBy, setOrderBy] = useState<string>('');
+  const [order, setOrder] = useState<'asc' | 'desc'>('asc');
+  // For minimized chat view
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [dataTitle, setDataTitle] = useState('');
+  const socketRef = useRef<WebSocket | null>(null);
+
+  const {
+    transcript,
+    listening,
+    resetTranscript,
+    browserSupportsSpeechRecognition
+  } = useSpeechRecognition();
+
+  useEffect(() => {
+    if (transcript) {
+      setInput(transcript);
+    }
+  }, [transcript]);
+
+  // Setup WebSocket connection
+  useEffect(() => {
+    // Create WebSocket connection
+    const socket = new WebSocket('ws://localhost:8000/ws');
+    socketRef.current = socket;
+
+    // Connection opened
+    socket.addEventListener('open', (_event) => {
+      console.log('Connected to WebSocket server');
+    });
+
+    // Listen for messages
+    socket.addEventListener('message', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('Message from server:', data);
+        
+        if (data.type === 'update' && data.room_id) {
+          // Update the data for this room
+          setSocketData(prevData => ({
+            ...prevData,
+            [data.room_id]: data.data
+          }));
+          
+          // Find the message with this room_id and update it
+          setMessages(prevMessages => 
+            prevMessages.map(msg => {
+              if (msg.backgroundData?.room_id === data.room_id) {
+                return {
+                  ...msg,
+                  backgroundData: {
+                    ...msg.backgroundData,
+                    row_count: data.row_count
+                  }
+                };
+              }
+              return msg;
+            })
+          );
+        }
+      } catch (e) {
+        console.error('Error parsing WebSocket message:', e);
+      }
+    });
+
+    // Connection closed
+    socket.addEventListener('close', (_event) => {
+      console.log('Disconnected from WebSocket server');
+    });
+
+    // Clean up on unmount
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
+  }, []);
+
+  // Function to download Excel file from base64 data
+  const downloadExcelFromBase64 = (base64Data: string, filename: string) => {
+    // Convert base64 to binary
+    const binaryString = window.atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    // Create blob and download
+    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    saveAs(blob, filename);
+  };
+
+  // Define response data interface
+  interface ResponseData {
+    success?: boolean;
+    message?: string;
+    data?: any[];
+    excel_data?: ExcelData;
+    background_process?: BackgroundProcessData;
+  }
+
+  const handleSend = async () => {
+    if (!input.trim() || isLoading) return;
+    
+    // Add user message
+    const userMessage: Message = { text: input, isUser: true };
+    setMessages(prev => [...prev, userMessage]);
+    
+    // Clear input and set loading
+    setInput('');
+    setIsLoading(true);
+    resetTranscript();
+    
+    try {
+      // Send to API
+      const response = await API.buildQuery(input);
+      const responseData: ResponseData = response.data;
+      
+      if (responseData.success) {
+        // Create assistant message
+        const assistantMessage: Message = { 
+          text: responseData.message || 'Here is the data you requested.', 
+          isUser: false 
+        };
+        
+        // Handle different response types
+        if (responseData.data) {
+          assistantMessage.data = responseData.data;
+          assistantMessage.type = 'text';
+        } else if (responseData.excel_data) {
+          assistantMessage.excelData = responseData.excel_data;
+          assistantMessage.type = 'excel';
+        } else if (responseData.background_process) {
+          assistantMessage.backgroundData = responseData.background_process;
+          assistantMessage.type = 'background_process';
+          assistantMessage.isProcessing = true;
+        }
+        
+        // Add assistant message
+        setMessages(prev => [...prev, assistantMessage]);
+      } else {
+        // Handle error
+        setMessages(prev => [...prev, { 
+          text: responseData.message || 'Sorry, I encountered an error.', 
+          isUser: false 
+        }]);
+      }
+    } catch (error) {
+      console.error('Error sending message:', error);
+      setMessages(prev => [...prev, { 
+        text: 'Sorry, there was an error processing your request.', 
+        isUser: false 
+      }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const toggleListening = () => {
+    if (listening) {
+      SpeechRecognition.stopListening();
+    } else {
+      resetTranscript();
+      SpeechRecognition.startListening({ continuous: true });
+    }
+  };
+
+  // Sort function for table data
+  const sortData = (data: any[], property: string, direction: 'asc' | 'desc') => {
+    return [...data].sort((a, b) => {
+      const valueA = a[property];
+      const valueB = b[property];
+      
+      // Handle different data types
+      if (typeof valueA === 'number' && typeof valueB === 'number') {
+        return direction === 'asc' ? valueA - valueB : valueB - valueA;
+      }
+      
+      // Default string comparison
+      const stringA = String(valueA).toLowerCase();
+      const stringB = String(valueB).toLowerCase();
+      return direction === 'asc' 
+        ? stringA.localeCompare(stringB)
+        : stringB.localeCompare(stringA);
+    });
+  };
+
+  // Handle sort request
+  const handleRequestSort = (property: string) => {
+    const isAsc = orderBy === property && order === 'asc';
+    setOrder(isAsc ? 'desc' : 'asc');
+    setOrderBy(property);
+  };
+
+  // Handle view data button click
+  const handleViewData = (data: any[], title: string) => {
+    setCurrentViewData(data);
+    setShowDataTable(true);
+    setDataTitle(title);
+    setIsMinimized(true);
+  };
+
+  // Dynamic table component with sorting
+  const DynamicTable = ({ data, enableSort = true }: { data: any[], enableSort?: boolean }) => {
+    if (!data || data.length === 0) return null;
+    const headers = Object.keys(data[0]);
+    
+    // Apply sorting if enabled
+    const sortedData = enableSort && orderBy ? sortData(data, orderBy, order) : data;
+
+    return (
+      <Box sx={{ mt: 1, mb: 2 }}>
+        <TableContainer component={Paper} sx={{
+          maxHeight: 600,
+          boxShadow: 'none',
+          border: '1px solid #e0e0e0',
+          borderRadius: 1
+        }}>
+          <Table stickyHeader size="small">
+            <TableHead>
+              <TableRow>
+                {headers.map((header) => (
+                  <TableCell
+                    key={header}
+                    sx={{
+                      fontWeight: 'bold',
+                      color: '#ffffff',
+                      backgroundColor: '#1e8e9e',
+                      borderBottom: 'none'
+                    }}
+                  >
+                    {enableSort ? (
+                      <TableSortLabel
+                        active={orderBy === header}
+                        direction={orderBy === header ? order : 'asc'}
+                        onClick={() => handleRequestSort(header)}
+                        sx={{
+                          '& .MuiTableSortLabel-icon': {
+                            color: '#ffffff !important',
+                          },
+                          '&.Mui-active': {
+                            color: '#ffffff',
+                          },
+                          color: '#ffffff'
+                        }}
+                      >
+                        {header}
+                      </TableSortLabel>
+                    ) : (
+                      header
+                    )}
+                  </TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {sortedData.map((row, index) => (
+                <TableRow
+                  key={index}
+                  sx={{
+                    '&:nth-of-type(odd)': { bgcolor: '#f5f5f5' },
+                    '&:nth-of-type(even)': { bgcolor: '#ffffff' },
+                    '&:hover': { bgcolor: '#e0f7fa' }
+                  }}
+                >
+                  {headers.map((header) => (
+                    <TableCell
+                      key={`${index}-${header}`}
+                      sx={{ borderBottom: '1px solid #e0e0e0' }}
+                    >
+                      {row[header]}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+        {/* Excel download button removed as requested */}
+      </Box>
+    );
+  };
+
+  return (
+    <>
+      {listening && (
+        <Box sx={{ 
+          position: 'fixed', 
+          bottom: 100, 
+          left: 0,
+          right: 0,
+          width: '100%',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1400 
+        }}>
+          <Paper 
+            elevation={3} 
+            sx={{ 
+              p: 2, 
+              borderRadius: 2, 
+              border: '1px dashed #5e35b1',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              width: 200
+            }}
+          >
+            <Typography sx={{ color: '#5e35b1', mb: 1 }}>Listening</Typography>
+            <Box sx={{ 
+              width: '100%', 
+              height: 30, 
+              position: 'relative',
+              '&::before': {
+                content: '""',
+                position: 'absolute',
+                top: '50%',
+                left: 0,
+                right: 0,
+                height: 1,
+                backgroundColor: '#e0e0e0',
+                zIndex: 0
+              }
+            }}>
+              <Box sx={{ 
+                width: '100%', 
+                height: '100%', 
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                position: 'relative',
+                zIndex: 1
+              }}>
+                {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
+                  <Box 
+                    key={i} 
+                    sx={{ 
+                      width: 2, 
+                      height: Math.floor(Math.random() * 20) + 5, 
+                      backgroundColor: '#5e35b1'
+                    }} 
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Paper>
+        </Box>
+      )}
+      
+      {/* Data Table View (shown when data is being viewed) */}
+      {showDataTable && isMinimized && (
+        <Box
+          sx={{
+            position: 'fixed',
+            top: 0,
+            left: 0, // Take full width
+            right: { xs: 0, sm: '400px' }, // On desktop, leave space for chat on right
+            bottom: 0,
+            p: { xs: 1, sm: 3 }, // Less padding on mobile
+            overflow: 'auto',
+            bgcolor: '#ffffff', // White background
+            zIndex: { xs: isOpen ? 0 : 1200, sm: 1200 }, // On mobile, hide when chat is open
+            display: { xs: isOpen ? 'none' : 'block', sm: 'block' } // Hide on mobile when chat is open
+          }}
+        >
+          <Paper elevation={0} sx={{ p: 3, height: 'calc(100% - 24px)', bgcolor: '#ffffff' }}>
+            <Typography variant="h5" gutterBottom sx={{ color: '#1e8e9e' }}>{dataTitle}</Typography>
+            <DynamicTable data={currentViewData} />
+            <Button
+              variant="outlined"
+              size="small"
+              sx={{ mt: 2, color: '#5e35b1', borderColor: '#5e35b1' }}
+              onClick={() => {
+                setShowDataTable(false);
+                setIsMinimized(false);
+              }}
+            >
+              Close Data View
+            </Button>
+          </Paper>
+        </Box>
+      )}
+
+      {/* Chat Assistant (normal or minimized) */}
+      <Box sx={{
+        position: 'fixed',
+        bottom: 0,
+        ...(isMinimized ? {
+          right: 0, // Fixed to right side
+          width: { xs: '100%', sm: '350px' }, // Mobile: full width, Desktop: 350px
+          height: { xs: 'calc(100vh - 56px)', sm: '600px' }, // Mobile: full height minus header, Desktop: 600px
+        } : {
+          left: 0,
+          right: 0,
+          top: 0,
+        }),
+        zIndex: 1300,
+      }}>
+        <Fab
+          sx={{
+            position: 'fixed',
+            bottom: 24,
+            right: 24,
+            display: isOpen ? 'none' : 'flex',
+            bgcolor: '#5e35b1',
+            color: '#ffffff',
+            '&:hover': { bgcolor: '#4527a0' }
+          }}
+          onClick={() => setIsOpen(true)}
+        >
+          <SmartToyIcon />
+        </Fab>
+
+        <Dialog
+          open={isOpen}
+          onClose={() => {
+            if (showDataTable && isMinimized) {
+              setIsOpen(false);
+            } else {
+              setIsOpen(false);
+              setShowDataTable(false);
+              setIsMinimized(false);
+            }
+          }}
+          maxWidth={isMinimized ? false : "md"}
+          fullWidth={!isMinimized}
+          slotProps={{
+            paper: {
+              sx: {
+                height: isMinimized
+                  ? { xs: 'calc(100vh - 56px)', sm: '600px' } // Mobile: full height minus header, Desktop: 600px
+                  : '80vh',
+                maxHeight: isMinimized
+                  ? { xs: 'calc(100vh - 56px)', sm: '700px' } // Mobile: full height minus header, Desktop: 700px
+                  : '80vh',
+                width: isMinimized
+                  ? { xs: '100%', sm: '350px' } // Mobile: full width, Desktop: 350px
+                  : undefined,
+                maxWidth: isMinimized ? { sm: '350px' } : undefined, // Desktop max width: 350px
+                position: isMinimized ? 'fixed' : undefined,
+                bottom: isMinimized ? 0 : undefined,
+                right: isMinimized ? 0 : undefined, // Fixed to right side instead of left
+                m: isMinimized ? { xs: 0, sm: 2 } : undefined, // No margin on mobile, 16px on desktop
+                borderRadius: isMinimized ? { xs: '16px 16px 0 0', sm: 8 } : undefined, // Rounded top corners on mobile
+                boxShadow: isMinimized ? 8 : undefined, // Stronger shadow when minimized
+                bgcolor: '#ffffff', // White background
+                color: '#000000', // Black text
+                overflow: 'hidden'
+              }
+            }
+          }}
+        >
+          <Box sx={{ p: 1, display: 'flex', justifyContent: 'space-between', borderBottom: 0, bgcolor: '#5e35b1' }}>
+            <Typography variant="subtitle1" sx={{ p: 1, fontWeight: 'medium', color: '#ffffff' }}>
+              AI SQL Assistant
+            </Typography>
+            <Box>
+              {isMinimized && showDataTable && (
+                <IconButton
+                  size="small"
+                  onClick={() => setIsMinimized(false)}
+                  title="Expand chat"
+                  sx={{ color: '#ffffff' }}
+                >
+                  <FullscreenIcon fontSize="small" />
+                </IconButton>
+              )}
+              <IconButton
+                size="small"
+                onClick={() => setIsOpen(false)}
+                title="Close chat"
+                sx={{ color: '#ffffff' }}
+              >
+                <CloseIcon fontSize="small" />
+              </IconButton>
+            </Box>
+          </Box>
+
+          <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', p: 2 }}>
+            <Paper
+              elevation={0}
+              sx={{
+                flexGrow: 1,
+                padding: 2,
+                marginBottom: 2,
+                overflow: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                bgcolor: '#ffffff',
+                border: 0,
+                borderRadius: 1
+              }}
+            >
+              {messages.map((message, index) => (
+                <Box
+                  key={index}
+                  sx={{
+                    alignSelf: message.isUser ? 'flex-end' : 'flex-start',
+                    backgroundColor: message.isUser ? '#ffffff' : '#ede7f6',
+                    border: message.isUser ? '1px solid #e0e0e0' : 0,
+                    padding: 2,
+                    borderRadius: 2,
+                    marginBottom: 1,
+                    maxWidth: message.type !== 'text' ? '95%' : '80%',
+                    width: message.type !== 'text' ? '95%' : 'auto'
+                  }}
+                >
+                  <Typography>{message.text}</Typography>
+
+                  {/* Display View Data button for table data */}
+                  {message.data && message.data.length > 0 && (
+                    <Box sx={{ mt: 2 }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        onClick={() => handleViewData(message.data!, 'Query Results')}
+                        startIcon={<FileDownloadIcon />}
+                        sx={{ mr: 1 }}
+                      >
+                        View Data
+                      </Button>
+                      <Typography variant="caption" color="text.secondary">
+                        {message.data.length} rows
+                      </Typography>
+                    </Box>
+                  )}
+
+                  {/* Display Excel download button */}
+                  {message.excelData && (
+                    <Box sx={{ mt: 2 }}>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        onClick={() => downloadExcelFromBase64(
+                          message.excelData!.excel_data,
+                          message.excelData!.filename
+                        )}
+                        startIcon={<DownloadIcon />}
+                        sx={{ mr: 1 }}
+                      >
+                        Download Excel
+                      </Button>
+                      <Typography variant="caption" color="text.secondary">
+                        {message.excelData.row_count} rows
+                      </Typography>
+                    </Box>
+                  )}
+
+                  {/* Display background process status */}
+                  {message.backgroundData && (
+                    <Box sx={{ mt: 2 }}>
+                      {message.isProcessing ? (
+                        <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                          <CircularProgress size={20} sx={{ mr: 1 }} />
+                          <Typography variant="body2">
+                            Processing {message.backgroundData.row_count} rows...
+                          </Typography>
+                        </Box>
+                      ) : (
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          onClick={() => {
+                            // Handle viewing background process results
+                          }}
+                        >
+                          View Results
+                        </Button>
+                      )}
+                    </Box>
+                  )}
+                </Box>
+              ))}
+              {isLoading && (
+                <Box sx={{ alignSelf: 'flex-start', padding: 2 }}>
+                  <Typography color="text.secondary">Thinking...</Typography>
+                </Box>
+              )}
+            </Paper>
+
+            <Box sx={{ display: 'flex', gap: 1, mt: 2 }}>
+              <Box sx={{ position: 'relative', width: '100%' }}>
+                <TextField
+                  fullWidth
+                  variant="outlined"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                  placeholder="Ask a question..."
+                  sx={{
+                    '& .MuiOutlinedInput-root': {
+                      borderRadius: '30px',
+                      backgroundColor: '#ffffff',
+                      '& fieldset': { borderColor: '#e0e0e0' },
+                      paddingLeft: '40px',
+                      paddingRight: browserSupportsSpeechRecognition ? '40px' : '14px'
+                    }
+                  }}
+                />
+                <HelpOutlineIcon 
+                  sx={{ 
+                    position: 'absolute', 
+                    left: '12px', 
+                    top: '50%', 
+                    transform: 'translateY(-50%)', 
+                    color: '#9e9e9e',
+                    zIndex: 1
+                  }} 
+                />
+                {browserSupportsSpeechRecognition && (
+                  <IconButton
+                    onClick={toggleListening}
+                    sx={{ 
+                      position: 'absolute', 
+                      right: '8px', 
+                      top: '50%', 
+                      transform: 'translateY(-50%)',
+                      color: listening ? '#f44336' : '#5e35b1',
+                      zIndex: 1
+                    }}
+                  >
+                    {listening ? <StopIcon /> : <MicIcon />}
+                  </IconButton>
+                )}
+              </Box>
+              <Button
+                variant="contained"
+                onClick={handleSend}
+                disabled={!input.trim() || isLoading}
+                sx={{ 
+                  bgcolor: '#5e35b1', 
+                  '&:hover': { bgcolor: '#4527a0' },
+                  borderRadius: '50%',
+                  minWidth: '48px',
+                  width: '48px',
+                  height: '48px',
+                  padding: 0
+                }}
+              >
+                <SendIcon />
+              </Button>
+            </Box>
+          </Box>
+        </Dialog>
+      </Box>
+    </>
+  );
+};
+
+export default Assistant;
